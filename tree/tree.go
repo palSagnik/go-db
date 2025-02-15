@@ -38,13 +38,6 @@ getKey(n): 					Get the nth key data as a slice.
 getVal(n): 					Get the nth value data as a slice (for leaf nodes).
 */
 
-type BTree struct {
-	root uint64              // pointer (a nonzero page number)
-	get  func(uint64) []byte // dereference a pointer
-	new  func([]byte) uint64 // allocate a new page
-	del  func(uint64)        // deallocate a page
-}
-
 type BNode []byte
 
 // header
@@ -133,29 +126,12 @@ func (node BNode) getVal(idx uint16) []byte {
 	keylen := binary.LittleEndian.Uint16(node[kvpos:])
 	vlen := binary.LittleEndian.Uint16(node[kvpos+2:])
 
-	return node[kvpos+4+keylen:][:vlen]
+	return node[kvpos + HEADER + keylen:][:vlen]
 }
 
 // node size in bytes
 func (node BNode) nbytes() uint16 {
 	return node.kvPos(node.nkeys())
-}
-
-// TODO(sagnik): Binary Search
-func nodeLookupLE(node BNode, key []byte) uint16 {
-	nkeys := node.nkeys()
-	found := uint16(0)
-
-	for i := uint16(1); i < nkeys; i++ {
-		cmp := bytes.Compare(node.getKey(i), key)
-		if cmp <= 0 {
-			found = i
-		}
-		if cmp >= 0 {
-			break
-		}
-	}
-	return found
 }
 
 func leafInsert(new BNode, old BNode, idx uint16, key []byte, val []byte) {
@@ -167,6 +143,14 @@ func leafInsert(new BNode, old BNode, idx uint16, key []byte, val []byte) {
 	nodeAppendRange(new, old, idx, idx + 1, old.nkeys() - idx)
 }
 
+func leafUpdate(new BNode, old BNode, idx uint16, key []byte, val []byte) {
+
+	// set the header
+	new.setHeader(BNODE_LEAF, old.nkeys())
+	nodeAppendRange(new, old, 0, 0, idx)		 // keys before idx
+	nodeAppendKV(new, idx, 0, key, val)          // new key
+	nodeAppendRange(new, old, idx, idx + 1, old.nkeys() - (idx + 1))
+}
 
 // nodeAppendKV inserts a new KV into the given index
 func nodeAppendKV(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
@@ -182,8 +166,8 @@ func nodeAppendKV(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
 	binary.LittleEndian.PutUint16(new[pos + 2:], uint16(len(val)))
 
 	// copying key and value
-	copy(new[pos + 4:], key)
-	copy(new[pos + 4 + uint16(len(key)):], val)
+	copy(new[pos + HEADER:], key)
+	copy(new[pos + HEADER + uint16(len(key)):], val)
 
 	// set offset
 	new.setOffset(idx + 1, new.getOffset(idx) + 4 + uint16(len(key) + len(val)))
@@ -195,4 +179,94 @@ func nodeAppendRange(new BNode, old BNode, dstNew uint16, srcOld uint16, n uint1
 		dst, src := dstNew + i, srcOld + i
 		nodeAppendKV(new, dst, old.getPtr(src), old.getKey(src), old.getVal(src))
 	}
+}
+
+// TODO(sagnik): Binary Search
+func nodeLookupLE(node BNode, key []byte) uint16 {
+	nkeys := node.nkeys()
+
+	var i uint16
+	for i = 0; i < nkeys; i++ {
+		cmp := bytes.Compare(node.getKey(i), key)
+		if cmp == 0 {
+			return i
+		}
+		if cmp > 0 {
+			return i - 1
+		}
+	}
+	return i - 1
+}
+
+// split an oversized node into 2 nodes
+func nodeSplitInTwo(left BNode, right BNode, old BNode) {
+	assert.Assert(old.nkeys() >= 2, "there must be atleast 2 keys")
+
+	// left half
+	nleft := old.nkeys() / 2
+	leftBytes := func () uint16 {
+		return HEADER + 8 * nleft + 2 * nleft + old.getOffset(nleft)
+	}
+	for leftBytes() > BTREE_PAGE_SIZE {
+		nleft--
+	}
+	assert.Assert(nleft >= 1, "there must be atleast 1 key")
+
+	// right half
+	rightBytes := func () uint16 {
+		return old.nbytes() - leftBytes() + 4
+	}
+	for rightBytes() > BTREE_PAGE_SIZE {
+		nleft++
+	}
+	assert.Assert(nleft < old.nkeys(), "left half size should not exceed the total")
+
+	nright := old.nkeys() - nleft
+
+	left.setHeader(old.btype(), nleft)
+	right.setHeader(old.btype(), nright)
+	nodeAppendRange(left, old, 0, 0, nleft)
+	nodeAppendRange(right, old, 0, nleft, nright)
+
+	// NOTE: we have only made sure that the right half is of proper size,
+	// 		 the left half might be still too big
+
+	assert.Assert(right.nbytes() <= BTREE_PAGE_SIZE, "the right half size is less than page size")
+}
+
+func nodeSplitInThree(old BNode) (uint16, [3]BNode) {
+	if old.nbytes() <= BTREE_PAGE_SIZE {
+		old = old[:BTREE_PAGE_SIZE]
+		return 1, [3]BNode{old}    // not split
+	}
+
+	left := BNode(make([]byte, 2 * BTREE_PAGE_SIZE))
+	right := BNode(make([]byte, BTREE_PAGE_SIZE))
+	nodeSplitInTwo(left, right, old)
+
+	if left.nbytes() <= BTREE_PAGE_SIZE {
+		left = left[:BTREE_PAGE_SIZE]
+		return 2, [3]BNode{left, right} // 2 Nodes
+	}
+
+	// left still bigger
+	leftLeft := BNode(make([]byte, BTREE_PAGE_SIZE))
+	middle := BNode(make([]byte, BTREE_PAGE_SIZE))
+	nodeSplitInTwo(leftLeft, middle, left)
+	assert.Assert(leftLeft.nbytes() <= BTREE_PAGE_SIZE, "all nodes have been split to appropriate sizes")
+
+	return 2, [3]BNode{leftLeft, middle, right} // 3 Nodes
+}
+
+
+
+
+
+
+
+type BTree struct {
+	root uint64              // pointer (a nonzero page number)
+	get  func(uint64) []byte // dereference a pointer
+	new  func([]byte) uint64 // allocate a new page
+	del  func(uint64)        // deallocate a page
 }
