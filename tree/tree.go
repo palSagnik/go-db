@@ -259,14 +259,98 @@ func nodeSplitInThree(old BNode) (uint16, [3]BNode) {
 }
 
 
-
-
-
-
-
+// B+Tree structure
 type BTree struct {
-	root uint64              // pointer (a nonzero page number)
-	get  func(uint64) []byte // dereference a pointer
-	new  func([]byte) uint64 // allocate a new page
-	del  func(uint64)        // deallocate a page
+	// pointer (a nonzero page number)
+	root uint64              
+	
+	// callbacks for managing on-disk pages
+	// dereference a pointer
+	get  func(uint64) []byte
+	
+	// allocate a new page
+	new  func([]byte) uint64
+
+	// deallocate a page
+	del  func(uint64)        
 }
+
+func treeInsert(tree *BTree, node BNode, key []byte, val []byte) BNode {
+
+	// extra size allows it to exceed 1 page temporarily
+	new := BNode(make([]byte, 2 * BTREE_PAGE_SIZE))
+
+	// place to insert the key
+	idx := nodeLookupLE(node, key)
+	switch node.btype() {
+	
+	// leaf node
+	case BNODE_LEAF:
+		if bytes.Equal(key, new.getKey(idx)) {
+			leafUpdate(new, node, idx, key, val) 	 // found, update it 
+		} else {
+			leafInsert(new, node, idx + 1, key, val) // not found, insert it
+		}
+	
+	// internal node, walk into child node
+	case BNODE_NODE:
+		// recursive iteration to the child node
+		cptr := node.getPtr(idx)
+		cnode := treeInsert(tree, tree.get(cptr), key, val)
+
+		// split after insertion
+		nsplit, split := nodeSplitInThree(cnode)
+
+		// deallocate the node
+		tree.del(cptr)
+
+		// update the child links
+        nodeReplaceChildN(tree, new, node, idx, split[:nsplit]...)
+	}
+	return new
+}
+
+func nodeReplaceChildN(tree *BTree, new BNode, old BNode, idx uint16, children ...BNode) {
+	
+	inc := uint16(len(children))
+	new.setHeader(BNODE_NODE, old.nkeys() - inc + 1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	for i, node := range children {
+		nodeAppendKV(new, inc + uint16(i), tree.new(node), node.getKey(0), nil)
+	}
+	nodeAppendRange(new, old, idx + inc, idx + 1, old.nkeys() - (idx + 1))
+}
+
+// insert a new key or update an existing one
+func (tree *BTree) Insert(key []byte, val []byte) error {
+	// 1. check the length limit imposed by BTREE_MAX_VAL_SIZE, BTREE_MAX_KEY_SIZE
+	if err := checkLimit(key, val); err != nil {
+		return err
+	}
+
+	// 2. create the root node
+	if tree.root == 0 {
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+		// later ...
+		tree.root = tree.new(root)
+		return nil
+	}
+
+	// 3. insert key
+	node := treeInsert(tree, tree.get(tree.root), key, val)
+
+	// 4. grow the tree if root is split
+	nsplit, split := nodeSplitInThree(node)
+	tree.del(tree.root)
+	if nsplit > 1 {
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+		// later ...
+		tree.root = tree.new(root)
+	} else {
+		tree.root = tree.new(split[0])
+	}
+	return nil
+}
+
+// delete a key and returns whether the key was there
+func (tree *BTree) Delete(key []byte) (bool, error)
