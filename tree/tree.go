@@ -22,7 +22,7 @@ func init() {
 Node includes
 |<-- HEADER -->|
 | type | nkeys |  pointers  |   offsets   | key-values | unused |
-| 2B   |  2B   | nkeys * 8B | nkeys * 2B  |    ...     |
+| 2B   |  2B   | nkeys * 8B | nkeys * 2B  |    ...     |        |
 
 Key-Value Pair includes
 | klen | vlen | key | val |
@@ -85,7 +85,7 @@ func (node BNode) setPtr(idx uint16, val uint64) {
 // offset List
 func offsetPos(node BNode, idx uint16) uint16 {
 	assert.Assert(1 <= idx && idx <= node.nkeys(), "value of index must lie within bounds")
-	return HEADER + 8*node.nkeys() + 2*(idx-1)
+	return HEADER + 8 * node.nkeys() + 2 * (idx - 1)
 }
 
 func (node BNode) getOffset(idx uint16) uint16 {
@@ -282,6 +282,8 @@ func treeInsert(tree *BTree, node BNode, key []byte, val []byte) BNode {
 
 	// place to insert the key
 	idx := nodeLookupLE(node, key)
+	
+	// check node type
 	switch node.btype() {
 	
 	// leaf node
@@ -311,7 +313,6 @@ func treeInsert(tree *BTree, node BNode, key []byte, val []byte) BNode {
 }
 
 func nodeReplaceChildN(tree *BTree, new BNode, old BNode, idx uint16, children ...BNode) {
-	
 	inc := uint16(len(children))
 	new.setHeader(BNODE_NODE, old.nkeys() - inc + 1)
 	nodeAppendRange(new, old, 0, 0, idx)
@@ -324,14 +325,21 @@ func nodeReplaceChildN(tree *BTree, new BNode, old BNode, idx uint16, children .
 // insert a new key or update an existing one
 func (tree *BTree) Insert(key []byte, val []byte) error {
 	// 1. check the length limit imposed by BTREE_MAX_VAL_SIZE, BTREE_MAX_KEY_SIZE
-	if err := checkLimit(key, val); err != nil {
+	if err := assert.CheckLimit(key, BTREE_MAX_KEY_SIZE, val, BTREE_MAX_VAL_SIZE); err != nil {
 		return err
 	}
 
 	// 2. create the root node
 	if tree.root == 0 {
+
+		// use the concept of sentinel value, where at the first node an empty key is inserted to eliminate edge cases
 		root := BNode(make([]byte, BTREE_PAGE_SIZE))
-		// later ...
+		root.setHeader(BNODE_LEAF, 2)
+		
+		// a dummy key, this makes the tree cover the whole key space.
+        // thus a lookup can always find a containing node.
+		nodeAppendKV(root, 0, 0, nil, nil)
+		nodeAppendKV(root, 1, 0, nil, nil)
 		tree.root = tree.new(root)
 		return nil
 	}
@@ -344,12 +352,142 @@ func (tree *BTree) Insert(key []byte, val []byte) error {
 	tree.del(tree.root)
 	if nsplit > 1 {
 		root := BNode(make([]byte, BTREE_PAGE_SIZE))
-		// later ...
+		root.setHeader(BNODE_NODE, nsplit)
+
+		for i, knode := range split[:nsplit] {
+			ptr, key := tree.new(knode), knode.getKey(0)
+			nodeAppendKV(root, uint16(i), ptr, key, nil)
+		}
 		tree.root = tree.new(root)
 	} else {
 		tree.root = tree.new(split[0])
 	}
 	return nil
+}
+
+// TODO(sagnik): Deletion
+// delete a key from the tree
+func treeDelete(tree *BTree, node BNode, key []byte) BNode {
+
+	new := BNode(make([]byte, BTREE_PAGE_SIZE))
+	idx := nodeLookupLE(node, key)
+
+	switch node.btype() {
+	case BNODE_LEAF:
+		leafDelete(new, node, idx)
+	
+	case BNODE_NODE:
+		new = internalNodeDelete(tree, node, idx, key)
+	}
+
+	return new
+}
+
+// leafDelete removes a key from a leaf node
+func leafDelete(new BNode, old BNode, idx uint16) {
+
+	// changing number of nkeys
+	new.setHeader(BNODE_LEAF, old.nkeys() - 1)
+
+	// copy the kvs before idx
+	nodeAppendRange(new, old, 0, 0, idx)
+
+	// copy the keys after idx, skip idx
+	nodeAppendRange(new, old, idx, idx + 1, old.nkeys() - idx - 1)
+}
+
+// internalNodeDelete removes a key from an internal node
+func internalNodeDelete(tree *BTree, node BNode, idx uint16, key []byte) BNode {
+	// search
+	kptr := node.getPtr(idx)
+	updated := treeDelete(tree, tree.get(kptr), key)
+	if len(updated) == 0 {
+		return BNode{} // not found
+	}
+	tree.del(kptr)
+
+	// merge
+	new := BNode(make([]byte, BTREE_PAGE_SIZE))
+
+	mergeChoice, sibling := shouldMerge(tree, node, idx, updated)
+
+	switch {
+	
+	// left
+	case mergeChoice == -1:
+		merged := BNode(make([]byte, BTREE_PAGE_SIZE))
+		nodeMerge(merged, sibling, updated)
+		tree.del(node.getPtr(idx - 1))
+		nodeReplaceTwoChild(new, node, idx - 1, tree.new(merged), merged.getKey(0))
+	
+	// right
+	case mergeChoice == 1:
+		merged := BNode(make([]byte, BTREE_PAGE_SIZE))
+		nodeMerge(merged, updated, sibling)
+		tree.del(node.getPtr(idx + 1))
+		nodeReplaceTwoChild(new, node, idx + 1, tree.new(merged), merged.getKey(0))
+
+	// 1 empty child no sibling
+	// parent becomes empty too
+	case mergeChoice == 0 && updated.nkeys() == 0:
+		assert.Assert(node.nkeys() == 1 && idx == 0, "an empty child with no siblings")
+		new.setHeader(BNODE_NODE, 0)
+	
+	// no merge
+	case mergeChoice == 0 && updated.nkeys() > 0:
+		nodeReplaceChildN(tree, new, node, idx, updated)
+	}
+
+	return new
+}
+
+// should the updated child be merged with sibling
+func shouldMerge(tree *BTree, node BNode, idx uint16, updatedNode BNode) (int, BNode) {
+	if updatedNode.nbytes() > BTREE_PAGE_SIZE/4 {
+		return 0, BNode{}
+	}
+
+	// check for left
+	if idx > 0 {
+		sibling := BNode(tree.get(node.getPtr(idx - 1)))
+		mergedBytes := sibling.nbytes() + updatedNode.nbytes() - HEADER
+		if mergedBytes <= BTREE_PAGE_SIZE {
+			return -1, sibling 	// left
+		}
+	}
+
+	// check for right
+	if idx + 1 < node.nkeys() {
+		sibling := BNode(tree.get(node.getPtr(idx + 1)))
+		mergedBytes := sibling.nbytes() + updatedNode.nbytes() - HEADER
+		if mergedBytes <= BTREE_PAGE_SIZE {
+			return 1, sibling 	// right
+		}
+	}
+	return 0, BNode{}
+}
+
+func nodeMerge(new BNode, left BNode, right BNode) {
+	new.setHeader(left.btype(), left.nkeys() + right.nkeys())
+
+	// copy from left node
+	nodeAppendRange(new, left, 0, 0, left.nkeys())
+
+	// copy from right node
+	nodeAppendRange(new, right, left.nkeys(), 0, right.nkeys())
+}
+
+func nodeReplaceTwoChild(new BNode, old BNode, idx uint16, ptr uint64, key []byte) {
+	new.setHeader(BNODE_NODE, old.nkeys() - 1)
+
+	// copy kvs before idx
+	nodeAppendRange(new, old, 0, 0, idx)
+
+	// copy the merged child at idx
+	nodeAppendKV(new, idx, ptr, key, old.getVal(idx))
+
+	// copy everything after the two replaced keys
+	nodeAppendRange(new, old, idx + 1, idx + 2, old.nkeys() - idx - 2)
 }
 
 // delete a key and returns whether the key was there
