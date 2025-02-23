@@ -176,6 +176,12 @@ func nodeAppendKV(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
 
 // nodeAppendRange copies multiple KVs into the position from the old node
 func nodeAppendRange(new BNode, old BNode, dstNew uint16, srcOld uint16, n uint16) {
+	assert.Assert(srcOld + n <= old.nbytes(), "number of keys in old node must not exceed the given limit")
+	assert.Assert(dstNew + n <= new.nbytes(), "number of keys in new node must not exceed the given limit")
+	if n == 0 {
+		return
+	}
+
 	for i := uint16(0); i < n; i++ {
 		dst, src := dstNew+i, srcOld+i
 		nodeAppendKV(new, dst, old.getPtr(src), old.getKey(src), old.getVal(src))
@@ -312,12 +318,23 @@ func treeInsert(tree *BTree, node BNode, key []byte, val []byte) BNode {
 	return new
 }
 
+// replace link with same key
+func nodeReplaceChildWithPtr(new BNode, old BNode, idx uint16, ptr uint64) {
+	copy(new, old[:old.nbytes()])
+	new.setPtr(idx, ptr)
+}
+
 func nodeReplaceChildN(tree *BTree, new BNode, old BNode, idx uint16, children ...BNode) {
 	inc := uint16(len(children))
+	if inc == 1 && bytes.Equal(children[0].getKey(0), old.getKey(0)) {
+		nodeReplaceChildWithPtr(new, old, idx, tree.new(children[0]))
+		return
+	}
+
 	new.setHeader(BNODE_NODE, old.nkeys()-inc+1)
 	nodeAppendRange(new, old, 0, 0, idx)
 	for i, node := range children {
-		nodeAppendKV(new, inc+uint16(i), tree.new(node), node.getKey(0), nil)
+		nodeAppendKV(new, idx+uint16(i), tree.new(node), node.getKey(0), nil)
 	}
 	nodeAppendRange(new, old, idx+inc, idx+1, old.nkeys()-(idx+1))
 }
@@ -374,6 +391,9 @@ func treeDelete(tree *BTree, node BNode, key []byte) BNode {
 
 	switch node.btype() {
 	case BNODE_LEAF:
+		if !bytes.Equal(key, node.getKey(idx)) {
+			return BNode{}
+		}
 		leafDelete(new, node, idx)
 
 	case BNODE_NODE:
@@ -508,3 +528,32 @@ func (tree *BTree) Delete(key []byte) (bool, error) {
 
 	return true, nil
 }
+
+func (tree *BTree) Get (key []byte) ([]byte, bool) {
+	if tree.root == 0 {
+		return nil, false
+	}
+	return nodeGetKey(tree, tree.get(tree.root), key)
+}
+
+// nodeGetKey returns BNode given a key 
+func nodeGetKey(tree *BTree, node BNode, key []byte) ([]byte, bool) {
+	idx := nodeLookupLE(node, key)
+	switch node.btype() {
+	
+	// node is stored in leaf node
+	case BNODE_LEAF:
+		if bytes.Equal(key, node.getKey(idx)) {
+			return node.getVal(idx), true
+		} else {
+			return nil, false
+		}
+	
+	// internal node only stores links
+	case BNODE_NODE:
+		return nodeGetKey(tree, node, key)
+	default:
+		panic("there is a bad node!")
+	}
+}
+
